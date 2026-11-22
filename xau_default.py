@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ready-to-run XAU/USD 1D SMA20 crossing alerts (XAUS price-reference feed).
+"""Ready-to-run XAU/USD 1D SMA5 monitoring (XAUS price-reference feed).
 
 NOT a GOLD NOW broker feed. Data providers may differ; never place trades with this.
 Python 3.10+; no dependencies beyond standard library.
@@ -30,12 +30,13 @@ DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_HISTORY_REFRESH_SECONDS = 6 * 3600
 DEFAULT_MAX_SPOT_AGE_SECONDS = 300
 RESET_GAP_SECONDS = 600
+SMA_PERIOD = 5  # 1 live price + 4 prior completed daily closes
 
 
 def read_json(url: str, *, max_bytes: int = 3_000_000) -> dict:
     if url not in (SPOT_URL, HISTORY_URL):
         raise ValueError("Only documented XAUS API URLs allowed")
-    req = Request(url, headers={"User-Agent": "Gold-XAU-1D-SMA20-PersonalMonitor/1.0",
+    req = Request(url, headers={"User-Agent": f"Gold-XAU-1D-SMA{SMA_PERIOD}-PersonalMonitor/1.0",
                                 "Accept": "application/json", "Cache-Control": "no-cache"})
     with urlopen(req, timeout=18) as response:
         if response.status != 200:
@@ -85,7 +86,7 @@ def spot_from_data(data: dict, *, now: datetime | None = None) -> tuple[Decimal,
 
 
 def completed_closes(data: dict, *, spot_time: datetime) -> list[tuple[date, Decimal]]:
-    """Get 19 latest COMPLETED UTC-date daily bars before spot's current date.
+    """Get the previous completed UTC daily closes used in the SMA.
 
     XAUS history may be from Yahoo while spot is another upstream: a proxy SMA,
     never asserted to be a broker-specific indicator value.
@@ -116,20 +117,21 @@ def completed_closes(data: dict, *, spot_time: datetime) -> list[tuple[date, Dec
             raise ValueError(f"Conflicting historical close for {d}")
         unique[d] = p
     filtered = sorted(unique.items())
-    if len(filtered) < 19:
-        raise ValueError("Need at least 19 completed daily closes")
-    last19 = filtered[-19:]
-    if (spot_time.date() - last19[-1][0]).days > 6:
+    required = SMA_PERIOD - 1
+    if len(filtered) < required:
+        raise ValueError(f"Need at least {required} completed daily closes")
+    recent_closes = filtered[-required:]
+    if (spot_time.date() - recent_closes[-1][0]).days > 6:
         raise ValueError("Most recent daily close is too old")
-    return last19
+    return recent_closes
 
 
 def calculate_quote(spot_data: dict, history_data: dict, *, now: datetime | None = None):
     price, seen_at = spot_from_data(spot_data, now=now)
     prior = completed_closes(history_data, spot_time=seen_at)
-    average = (sum((x for _, x in prior), Decimal(0)) + price) / Decimal(20)
+    average = (sum((x for _, x in prior), Decimal(0)) + price) / Decimal(SMA_PERIOD)
     quote = Quote(price=price, average=average, observed_at=seen_at,
-                  symbol="XAU/USD · 1D SMA20 (reference)", unit="USD/oz", source=SOURCE)
+                  symbol=f"XAU/USD · 1D SMA{SMA_PERIOD} (reference)", unit="USD/oz", source=SOURCE)
     anchor = ",".join(d.isoformat() for d, _ in prior)
     return quote, anchor
 
@@ -157,7 +159,7 @@ class HistoryCache:
 def status_line(q: Quote) -> str:
     difference = q.price - q.average
     sign = "เหนือ" if difference > 0 else "ใต้" if difference < 0 else "เท่ากับ"
-    return (f"XAU/USD {fmt(q.price)} USD/oz  |  SMA20 {fmt(q.average)} USD/oz  "
+    return (f"XAU/USD {fmt(q.price)} USD/oz  |  SMA{SMA_PERIOD} {fmt(q.average)} USD/oz  "
             f"|  {sign}เส้นเฉลี่ย  |  quote: {q.observed_at.isoformat()}")
 
 
@@ -187,73 +189,3 @@ def run_once(cache: HistoryCache, *, service: AlertService | None = None,
         reset_on_gap(service, quote, anchor=anchor)
         service.accept(quote)
     return quote
-
-
-def run_demo() -> None:
-    """Use fake XAU values and send a few test pushes to the phone."""
-    print("DEMO ONLY: Fake XAU/USD values. Not real market prices.", flush=True)
-    now = utc_now()
-    detector = CrossingDetector(cooldown=0, max_quote_age=3600)
-    samples = [(4001, 4005), (4003, 4005), (4006, 4005),
-               (4005, 4005), (4004, 4005), (4003, 4005)]
-    count = 0
-    for idx, (price, avg) in enumerate(samples):
-        q = Quote(Decimal(price), Decimal(avg), now + timedelta(seconds=idx),
-                  "XAU/USD DEMO (fake)", "USD/oz", "SIMULATION NOT MARKET")
-        event = detector.evaluate(q, check_freshness=False)
-        print(f"{idx + 1}. fake spot={price}, fake SMA={avg}")
-        if event:
-            send_push(event)
-            count += 1
-            print("   Test notification accepted by ntfy")
-    print(f"Demo pushes: {count}; check your phone.")
-
-
-def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-    parser = argparse.ArgumentParser(description="XAU/USD 1D SMA20 -> ntfy push (NOT broker-specific)")
-    sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("setup", help="Generate secret ntfy topic")
-    sub.add_parser("test-push", help="Send notification test")
-    sub.add_parser("check", help="Check spot/SMA20 without push")
-    sub.add_parser("run", help="Monitor price and notify on crossing")
-    sub.add_parser("demo", help="Simulated XAU/USD crossing alerts, no market feed")
-    args = parser.parse_args(argv)
-    load_env()
-    try:
-        if args.command == "setup":
-            setup()
-        elif args.command == "test-push":
-            send_push(is_test=True)
-            print("ntfy accepted test message. Check phone subscription + notification settings.")
-        elif args.command == "demo":
-            run_demo()
-        elif args.command == "check":
-            run_once(HistoryCache())
-        elif args.command == "run":
-            if not os.getenv("NTFY_TOPIC", "").strip():
-                raise ValueError("Run setup first to generate ntfy topic")
-            interval = int(os.getenv("XAU_POLL_SECONDS", str(DEFAULT_INTERVAL_SECONDS)))
-            if interval < 60:
-                raise ValueError("XAU_POLL_SECONDS must be >= 60 (XAUS fair-use)")
-            cache = HistoryCache()
-            service = AlertService()
-            print("Monitoring reference XAU/USD (not GOLD NOW). 1D/SMA20, Ctrl+C to stop.")
-            while True:
-                try:
-                    run_once(cache, service=service, notify=True)
-                except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError,
-                        json.JSONDecodeError, OSError) as exc:
-                    LOG.warning("No valid quote/notification this round: %s", exc)
-                time.sleep(interval)
-    except KeyboardInterrupt:
-        print("Stopped. No more alerts until this program runs again.")
-    except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError,
-            json.JSONDecodeError, OSError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
