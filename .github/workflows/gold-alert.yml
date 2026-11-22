@@ -2,12 +2,11 @@
 name: Gold XAUUSD SMA20 Alert
 
 on:
-  schedule:
-    - cron: "2-59/5 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: gold-alert
@@ -16,7 +15,7 @@ concurrency:
 jobs:
   check-gold:
     runs-on: ubuntu-latest
-    timeout-minutes: 7
+    timeout-minutes: 8
 
     steps:
       - name: Checkout repository
@@ -32,10 +31,20 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         shell: bash
         run: |
+          set -e
           for i in {1..5}; do
             echo "Checking XAU/USD - Round $i"
             python cloud_once.py
+
             if [ "$i" -lt 5 ]; then
               sleep 60
             fi
           done
+
+      - name: Start next workflow automatically
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run gold-alert.yml --ref main
+          echo "Next workflow requested successfully"
