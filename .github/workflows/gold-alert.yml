@@ -16,7 +16,8 @@ concurrency:
 jobs:
   check-gold:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 7
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,7 +27,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Check gold price
+      - name: Check gold every 1 minute
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python cloud_once.py
+        shell: bash
+        run: |
+          for i in {1..5}; do
+            echo "Checking XAU/USD - Round $i"
+            python cloud_once.py
+            if [ "$i" -lt 5 ]; then
+              sleep 60
+            fi
+          done
