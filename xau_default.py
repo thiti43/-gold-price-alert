@@ -189,3 +189,28 @@ def run_once(cache: HistoryCache, *, service: AlertService | None = None,
         reset_on_gap(service, quote, anchor=anchor)
         service.accept(quote)
     return quote
+
+from zoneinfo import ZoneInfo
+
+
+def market_session(now: datetime | None = None) -> tuple[str, str]:
+    """Reference XAU/USD trading hours in New York time."""
+    now = now or utc_now()
+    ny = now.astimezone(ZoneInfo("America/New_York"))
+
+    weekday = ny.weekday()
+    minute = ny.hour * 60 + ny.minute
+
+    # Weekend closure
+    if (
+        weekday == 5
+        or (weekday == 6 and minute < 18 * 60)
+        or (weekday == 4 and minute >= 17 * 60)
+    ):
+        return "closed", "สุดสัปดาห์"
+
+    # Daily trading break
+    if 17 * 60 <= minute < 18 * 60:
+        return "closed", "พักตลาดรายวัน"
+
+    return "open", "ช่วงเวลาซื้อขายอ้างอิง"
