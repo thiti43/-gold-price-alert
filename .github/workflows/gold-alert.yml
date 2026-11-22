@@ -1,5 +1,4 @@
-
-name: Gold XAUUSD SMA20 Alert
+name: Gold XAUUSD SMA5 Alert
 
 on:
   workflow_dispatch:
@@ -16,17 +15,24 @@ jobs:
   check-gold:
     runs-on: ubuntu-latest
     timeout-minutes: 8
-
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Check gold every 1 minute
+      - name: Restore last market state
+        uses: actions/cache/restore@v4
+        with:
+          path: .gold_market_state.json
+          key: gold-market-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            gold-market-state-
+
+      - name: Check gold every minute for five rounds
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         shell: bash
@@ -35,16 +41,22 @@ jobs:
           for i in {1..5}; do
             echo "Checking XAU/USD - Round $i"
             python cloud_once.py
-
             if [ "$i" -lt 5 ]; then
               sleep 60
             fi
           done
 
-      - name: Start next workflow automatically
-        if: ${{ success() }}
+      - name: Save latest market state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .gold_market_state.json
+          key: gold-market-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Start next workflow
+        if: success()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh workflow run gold-alert.yml --ref main
-          echo "Next workflow requested successfully"
+          echo "Next run requested"
