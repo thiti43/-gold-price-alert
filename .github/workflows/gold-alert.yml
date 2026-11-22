@@ -17,10 +17,10 @@ jobs:
     timeout-minutes: 8
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -32,19 +32,14 @@ jobs:
           restore-keys: |
             gold-market-state-
 
-      - name: Check gold every minute for five rounds
+     
+      - name: Monitor market every second
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         shell: bash
         run: |
-          set -e
-          for i in {1..5}; do
-            echo "Checking XAU/USD - Round $i"
-            python cloud_once.py
-            if [ "$i" -lt 5 ]; then
-              sleep 60
-            fi
-          done
+          python cloud_once.py
+
 
       - name: Save latest market state
         if: always()
