@@ -1,10 +1,11 @@
 
 #!/usr/bin/env python3
-"""XAU/USD SMA5 alerts plus market open/close notifications with price."""
+"""Gold XAU/USD: 1-second market monitoring and 60-second SMA5 checks."""
 
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -21,24 +22,21 @@ from xau_default import (
     valid_number,
 )
 
-STATE_PATH = Path(
-    os.getenv("GOLD_STATE_FILE", ".gold_market_state.json")
-)
+STATE_PATH = Path(".gold_market_state.json")
+CHECK_INTERVAL = 60
+WATCH_SECONDS = 300
 
 
 def read_state():
     try:
-        value = json.loads(
-            STATE_PATH.read_text(encoding="utf-8")
-        )
-        return value if isinstance(value, dict) else {}
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
 def save_state(state):
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
+    temp = STATE_PATH.with_suffix(".tmp")
     temp.write_text(
         json.dumps(state, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -46,28 +44,29 @@ def save_state(state):
     temp.replace(STATE_PATH)
 
 
-def push(kind, price, observed_at, average=None):
+def notify(kind, state):
+    price = state.get("last_price")
+    observed = state.get("last_quote_at")
+
     send_push({
         "kind": kind,
         "symbol": f"XAU/USD · SMA{SMA_PERIOD} (1D)",
-        "price": f"{Decimal(str(price)):.2f}",
+        "price": (
+            f"{Decimal(str(price)):.2f}"
+            if price is not None else "ยังไม่มีข้อมูล"
+        ),
         "average": (
-            f"{Decimal(str(average)):.2f}"
-            if average is not None
-            else "ไม่มี SMA ล่าสุด"
+            f"{Decimal(str(state['last_average'])):.2f}"
+            if state.get("last_average") is not None
+            else "ยังไม่มีข้อมูล"
         ),
         "unit": "USD/oz",
-        "at": observed_at,
-        "source": (
-            "XAUS.com indicative XAU/USD "
-            "(reference, not official close)"
-        ),
+        "at": observed or datetime.now(timezone.utc).isoformat(),
+        "source": "XAUS.com indicative reference price",
     })
 
 
-def last_reference_quote():
-    """Get last timestamped price even when the market is closed."""
-
+def fetch_last_reference(state):
     data = read_json(SPOT_URL)
     xau = data.get("xau")
 
@@ -76,168 +75,134 @@ def last_reference_quote():
         or xau.get("currency") != "USD"
         or xau.get("unit") not in ("oz", "troy_oz")
     ):
-        raise ValueError("Unexpected XAU/USD unit")
+        raise ValueError("Invalid XAU/USD quote unit")
 
-    price = valid_number(
-        data.get("spot_usd_oz"), "spot_usd_oz"
-    )
+    price = valid_number(data.get("spot_usd_oz"), "spot_usd_oz")
+    other = valid_number(xau.get("price"), "xau.price")
 
-    xau_price = valid_number(
-        xau.get("price"), "xau.price"
-    )
+    if abs(price - other) > Decimal("0.01"):
+        raise ValueError("Inconsistent XAU/USD price")
 
-    if abs(price - xau_price) > Decimal("0.01"):
-        raise ValueError("Spot price fields disagree")
-
-    state = data.get("data_state")
-
+    feed_state = data.get("data_state")
     timestamp = (
-        state.get("as_of")
-        if isinstance(state, dict)
-        else None
+        feed_state.get("as_of")
+        if isinstance(feed_state, dict) else None
     ) or data.get("updated_at")
 
     observed = parse_timestamp(timestamp)
 
     if observed > datetime.now(timezone.utc):
-        raise ValueError("Spot quote time is in the future")
+        raise ValueError("Future quote timestamp")
 
-    return price, observed.isoformat()
+    # Never replace a newer saved quote with an older quote.
+    old = state.get("last_quote_at")
+    if old and parse_timestamp(old) > observed:
+        return
+
+    state["last_price"] = str(price)
+    state["last_quote_at"] = observed.isoformat()
+    save_state(state)
+
+
+def check_market(state):
+    phase, reason = market_session(datetime.now(timezone.utc))
+    previous = state.get("phase")
+
+    if phase == "closed":
+        if previous != "closed":
+            # Keep last saved price if available.
+            notify(
+                f"🔴 ตลาดทองปิด ({reason}) | "
+                "ราคาอ้างอิงล่าสุด ไม่ใช่ราคาสด",
+                state,
+            )
+            state["phase"] = "closed"
+            save_state(state)
+            print("Market CLOSED notification sent", flush=True)
+        return phase
+
+    if previous == "closed":
+        notify(
+            "🟢 ตลาดทองเปิดแล้ว | "
+            "ราคาอ้างอิงล่าสุด รอราคาสดอัปเดต",
+            state,
+        )
+        state["phase"] = "open"
+        save_state(state)
+        print("Market OPEN notification sent", flush=True)
+
+    elif previous is None:
+        state["phase"] = "open"
+        save_state(state)
+
+    return phase
+
+
+def check_price(state, phase):
+    if phase == "closed":
+        if not state.get("last_price"):
+            fetch_last_reference(state)
+        return
+
+    spot = read_json(SPOT_URL)
+    history = read_json(HISTORY_URL)
+    quote, _ = calculate_quote(spot, history)
+
+    print(status_line(quote), flush=True)
+
+    state["last_price"] = str(quote.price)
+    state["last_average"] = str(quote.average)
+    state["last_quote_at"] = quote.observed_at.isoformat()
+    save_state(state)
+
+    if quote.price > quote.average:
+        kind = f"ราคาอยู่เหนือ SMA{SMA_PERIOD}"
+    elif quote.price < quote.average:
+        kind = f"ราคาอยู่ใต้ SMA{SMA_PERIOD}"
+    else:
+        kind = f"ราคาเท่ากับ SMA{SMA_PERIOD}"
+
+    notify(kind, state)
+    print("SMA notification sent", flush=True)
 
 
 def main():
     load_env()
 
     if not os.getenv("NTFY_TOPIC", "").strip():
-        print(
-            "Missing NTFY_TOPIC GitHub Actions secret",
-            file=sys.stderr,
-        )
+        print("Missing NTFY_TOPIC", file=sys.stderr)
         return 2
 
     state = read_state()
+    started = time.monotonic()
+    next_price_check = started
 
-    phase, reason = market_session(
-        datetime.now(timezone.utc)
-    )
+    print("Starting 1-second market monitor", flush=True)
 
-    previous_phase = state.get("phase")
+    while True:
+        now = time.monotonic()
+        if now - started >= WATCH_SECONDS:
+            break
 
-    # ----------------------------------
-    # MARKET CLOSED
-    # ----------------------------------
+        try:
+            phase = check_market(state)
+        except Exception as exc:
+            print(f"Market check failed: {exc}", flush=True)
+            phase = None
 
-    if phase == "closed":
+        if now >= next_price_check:
+            next_price_check = now + CHECK_INTERVAL
+            if phase is not None:
+                try:
+                    check_price(state, phase)
+                except Exception as exc:
+                    print(f"Price check failed: {exc}", flush=True)
 
-        if (
-            state.get("last_price") is None
-            or not state.get("last_quote_at")
-        ):
-            try:
-                price, seen_at = last_reference_quote()
+        remaining = WATCH_SECONDS - (time.monotonic() - started)
+        if remaining > 0:
+            time.sleep(min(1, remaining))
 
-                state["last_price"] = str(price)
-                state["last_quote_at"] = seen_at
-
-            except Exception as exc:
-                print(
-                    f"Market closed; last price unavailable: {exc}",
-                    flush=True,
-                )
-
-        if (
-            previous_phase != "closed"
-            or not state.get("closed_notified", False)
-        ):
-            if (
-                state.get("last_price") is not None
-                and state.get("last_quote_at")
-            ):
-                push(
-                    f"🔴 ตลาดปิด ({reason}) | "
-                    "ราคาอ้างอิงล่าสุด (ไม่ใช่ราคาสด)",
-                    state["last_price"],
-                    state["last_quote_at"],
-                    state.get("last_average"),
-                )
-
-                state["closed_notified"] = True
-
-                print(
-                    "Market close notification sent: "
-                    f"{state['last_price']} USD/oz "
-                    f"at {state['last_quote_at']}",
-                    flush=True,
-                )
-
-            else:
-                print(
-                    "Market closed; waiting for "
-                    "a timestamped reference price",
-                    flush=True,
-                )
-
-        else:
-            print(
-                f"Market closed: {reason}; "
-                "already notified with last price",
-                flush=True,
-            )
-
-        state["phase"] = "closed"
-        save_state(state)
-        return 0
-
-    # ----------------------------------
-    # MARKET OPEN
-    # ----------------------------------
-
-    spot = read_json(SPOT_URL)
-    history = read_json(HISTORY_URL)
-
-    quote, _anchor = calculate_quote(
-        spot, history
-    )
-
-    print(status_line(quote), flush=True)
-
-    if previous_phase == "closed":
-        kind = (
-            f"🟢 ตลาดเปิด ({reason}) | "
-            "ราคาใหม่ล่าสุด"
-        )
-
-    elif quote.price > quote.average:
-        kind = f"ราคาอยู่เหนือ SMA{SMA_PERIOD}"
-
-    elif quote.price < quote.average:
-        kind = f"ราคาอยู่ใต้ SMA{SMA_PERIOD}"
-
-    else:
-        kind = f"ราคาเท่ากับ SMA{SMA_PERIOD}"
-
-    push(
-        kind,
-        quote.price,
-        quote.observed_at.isoformat(),
-        quote.average,
-    )
-
-    state.update({
-        "phase": "open",
-        "closed_notified": False,
-        "last_price": str(quote.price),
-        "last_average": str(quote.average),
-        "last_quote_at": quote.observed_at.isoformat(),
-    })
-
-    save_state(state)
-
-    print(
-        "Notification accepted by ntfy",
-        flush=True,
-    )
-
+    print("Monitoring window completed", flush=True)
     return 0
 
 
