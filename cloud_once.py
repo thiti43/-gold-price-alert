@@ -1,112 +1,96 @@
-        state["phase"] = "open"
-        save_state(state)
-        print("Market OPEN notification sent", flush=True)
+#!/usr/bin/env python3
+"""Gold XAU/USD: 1-second market monitoring and 60-second SMA checks."""
 
-    elif previous is None:
-        state["phase"] = "open"
-        save_state(state)
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
 
-    return phase
+from gold_alert import load_env, parse_timestamp, send_push
+from xau_default import (
+    HISTORY_URL,
+    SPOT_URL,
+    SMA_PERIOD,
+    calculate_quote,
+    market_session,
+    read_json,
+    status_line,
+    valid_number,
+)
+
+STATE_PATH = Path(".gold_market_state.json")
+CHECK_INTERVAL = 60
+WATCH_SECONDS = 300
 
 
-def check_price(state, phase):
-    if phase == "closed":
-        if not state.get("last_price"):
-            fetch_last_reference(state)
-        return
+def read_state():
+    try:
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
-    spot = read_json(SPOT_URL)
-    history = read_json(HISTORY_URL)
-    quote, anchor = calculate_quote(spot, history)
 
-    print(status_line(quote), flush=True)
+def save_state(state):
+    temp = STATE_PATH.with_suffix(".tmp")
+    temp.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temp.replace(STATE_PATH)
 
-    # Do not process the same or older quote twice.
-    previous_time = state.get("cross_quote_at")
-    if previous_time and quote.observed_at <= parse_timestamp(previous_time):
-        print("Same or older quote; skipped", flush=True)
-        return
 
-    if quote.price > quote.average:
-        current_side = "above"
-    elif quote.price < quote.average:
-        current_side = "below"
-    else:
-        current_side = "equal"
+def notify(kind, state):
+    price = state.get("last_price")
+    observed = state.get("last_quote_at")
 
-    previous_side = state.get("cross_side")
-    previous_anchor = state.get("cross_anchor")
-    same_baseline = previous_anchor is not None and previous_anchor == anchor
-
-    # Alert when price rises from below to touch/cross the average,
-    # or falls from above to touch/cross the average.
-    crossed_up = same_baseline and previous_side == "below" and current_side in ("equal", "above")
-    crossed_down = same_baseline and previous_side == "above" and current_side in ("equal", "below")
-
-    # Prepare the updated price for the notification, without
-    # committing the new crossing state until a push succeeds.
-    next_state = dict(state)
-    next_state.update({
-        "last_price": str(quote.price),
-        "last_average": str(quote.average),
-        "last_quote_at": quote.observed_at.isoformat(),
-        "cross_side": current_side,
-        "cross_anchor": anchor,
-        "cross_quote_at": quote.observed_at.isoformat(),
+    send_push({
+        "kind": kind,
+        "symbol": f"XAU/USD · SMA{SMA_PERIOD} (1D)",
+        "price": (
+            f"{Decimal(str(price)):.2f}"
+            if price is not None else "ยังไม่มีข้อมูล"
+        ),
+        "average": (
+            f"{Decimal(str(state['last_average'])):.2f}"
+            if state.get("last_average") is not None
+            else "ยังไม่มีข้อมูล"
+        ),
+        "unit": "USD/oz",
+        "at": observed or datetime.now(timezone.utc).isoformat(),
+        "source": "XAUS.com indicative reference price",
     })
 
-    if crossed_up:
-        notify(f"🟢 ราคาทองขึ้นแตะ/ตัด SMA{SMA_PERIOD}", next_state)
-        print("CROSS UP notification sent", flush=True)
-    elif crossed_down:
-        notify(f"🔴 ราคาทองลงแตะ/ตัด SMA{SMA_PERIOD}", next_state)
-        print("CROSS DOWN notification sent", flush=True)
-    else:
-        print(f"No crossing: {current_side} SMA{SMA_PERIOD}", flush=True)
 
-    state.update(next_state)
-    save_state(state)
+def fetch_last_reference(state):
+    data = read_json(SPOT_URL)
+    xau = data.get("xau")
 
+    if (
+        not isinstance(xau, dict)
+        or xau.get("currency") != "USD"
+        or xau.get("unit") not in ("oz", "troy_oz")
+    ):
+        raise ValueError("Invalid XAU/USD quote unit")
 
-def main():
-    load_env()
+    price = valid_number(data.get("spot_usd_oz"), "spot_usd_oz")
+    other = valid_number(xau.get("price"), "xau.price")
 
-    if not os.getenv("NTFY_TOPIC", "").strip():
-        print("Missing NTFY_TOPIC", file=sys.stderr)
-        return 2
+    if abs(price - other) > Decimal("0.01"):
+        raise ValueError("Inconsistent XAU/USD price")
 
-    state = read_state()
-    started = time.monotonic()
-    next_price_check = started
+    feed_state = data.get("data_state")
+    timestamp = (
+        feed_state.get("as_of")
+        if isinstance(feed_state, dict) else None
+    ) or data.get("updated_at")
 
-    print("Starting 1-second market monitor", flush=True)
+    observed = parse_timestamp(timestamp)
 
-    while True:
-        now = time.monotonic()
-        if now - started >= WATCH_SECONDS:
-            break
+    if observed > datetime.now(timezone.utc):
+        raise ValueError("Future quote timestamp")
 
-        try:
-            phase = check_market(state)
-        except Exception as exc:
-            print(f"Market check failed: {exc}", flush=True)
-            phase = None
-
-        if now >= next_price_check:
-            next_price_check = now + CHECK_INTERVAL
-            if phase is not None:
-                try:
-                    check_price(state, phase)
-                except Exception as exc:
-                    print(f"Price check failed: {exc}", flush=True)
-
-        remaining = WATCH_SECONDS - (time.monotonic() - started)
-        if remaining > 0:
-            time.sleep(min(1, remaining))
-
-    print("Monitoring window completed", flush=True)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    # Never replace a newer saved quote with an older quote.
