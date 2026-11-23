@@ -23,7 +23,7 @@ from xau_default import (
 )
 
 STATE_PATH = Path(".gold_market_state.json")
-CHECK_INTERVAL = 60
+CHECK_INTERVAL = 1
 WATCH_SECONDS = 300
 
 
@@ -138,6 +138,7 @@ def check_market(state):
     return phase
 
 
+
 def check_price(state, phase):
     if phase == "closed":
         if not state.get("last_price"):
@@ -146,24 +147,94 @@ def check_price(state, phase):
 
     spot = read_json(SPOT_URL)
     history = read_json(HISTORY_URL)
-    quote, _ = calculate_quote(spot, history)
+    quote, anchor = calculate_quote(spot, history)
 
     print(status_line(quote), flush=True)
 
-    state["last_price"] = str(quote.price)
-    state["last_average"] = str(quote.average)
-    state["last_quote_at"] = quote.observed_at.isoformat()
-    save_state(state)
-
+    # Current position relative to SMA20
     if quote.price > quote.average:
-        kind = f"ราคาอยู่เหนือ SMA{SMA_PERIOD}"
+        current_side = "above"
     elif quote.price < quote.average:
-        kind = f"ราคาอยู่ใต้ SMA{SMA_PERIOD}"
+        current_side = "below"
     else:
-        kind = f"ราคาเท่ากับ SMA{SMA_PERIOD}"
+        current_side = "equal"
 
-    notify(kind, state)
-    print("SMA notification sent", flush=True)
+    previous_side = state.get("cross_side")
+    previous_anchor = state.get("cross_anchor")
+    previous_time = state.get("cross_quote_at")
+    previous_price_raw = state.get("cross_price")
+
+    # Do not process the same price timestamp twice
+    if previous_time:
+        if quote.observed_at <= parse_timestamp(previous_time):
+            print("Same or older quote; skipped", flush=True)
+            return
+
+    # Need an established baseline from the same
+    # set of daily closing candles
+    same_baseline = (
+        previous_anchor is not None
+        and previous_anchor == anchor
+        and previous_time is not None
+        and previous_price_raw is not None
+    )
+
+    previous_price = (
+        Decimal(str(previous_price_raw))
+        if same_baseline else None
+    )
+
+    # Price rises from below to TOUCH or CROSS SMA20
+    crossed_up = (
+        same_baseline
+        and previous_side == "below"
+        and current_side in ("equal", "above")
+        and quote.price > previous_price
+    )
+
+    # Price falls from above to TOUCH or CROSS SMA20
+    crossed_down = (
+        same_baseline
+        and previous_side == "above"
+        and current_side in ("equal", "below")
+        and quote.price < previous_price
+    )
+
+    # Prepare new state without changing original
+    # until notification succeeds
+    new_state = dict(state)
+    new_state.update({
+        "last_price": str(quote.price),
+        "last_average": str(quote.average),
+        "last_quote_at": quote.observed_at.isoformat(),
+        "cross_price": str(quote.price),
+        "cross_side": current_side,
+        "cross_anchor": anchor,
+        "cross_quote_at": quote.observed_at.isoformat(),
+    })
+
+    if crossed_up:
+        notify(
+            f"🟢 ราคาทองขึ้นแตะ/ตัด SMA{SMA_PERIOD}",
+            new_state,
+        )
+        print("CROSS UP ALERT SENT", flush=True)
+
+    elif crossed_down:
+        notify(
+            f"🔴 ราคาทองลงแตะ/ตัด SMA{SMA_PERIOD}",
+            new_state,
+        )
+        print("CROSS DOWN ALERT SENT", flush=True)
+
+    else:
+        print(
+            f"No crossing: {current_side} SMA{SMA_PERIOD}",
+            flush=True,
+        )
+
+    state.update(new_state)
+    save_state(state)
 
 
 def main():
