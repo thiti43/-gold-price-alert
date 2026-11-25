@@ -31,7 +31,7 @@ DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_HISTORY_REFRESH_SECONDS = 6 * 3600
 DEFAULT_MAX_SPOT_AGE_SECONDS = 300
 RESET_GAP_SECONDS = 600
-SMA_PERIOD = 5  # 1 live price + 4 prior completed daily closes
+SMA_PERIOD = 3  # 1 live price + 4 prior completed daily closes
 
 
 def read_json(url: str, *, max_bytes: int = 3_000_000) -> dict:
